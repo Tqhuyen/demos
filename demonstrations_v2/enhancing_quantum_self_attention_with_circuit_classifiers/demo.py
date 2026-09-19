@@ -1,6 +1,10 @@
 r"""Enhancing quantum self-attention with strongly entangling circuit classifiers
 =================================================================================
 
+Build and train a quantum self-attention-inspired binary classifier with PennyLane and PyTorch,
+following the circuit-classifier approach in [#Tran]_. Learn how its registers and readout work,
+then adapt its data, depth, and training setup using the practical recipes at the end.
+
 Quantum self-attention explores quantum-circuit alternatives to the classical self-attention
 mechanism at the heart of modern deep-learning models. Several architectures were proposed recently,
 including the quantum self-attention network (QSAN) [#QSAN]_, the quantum kernel self-attention
@@ -22,6 +26,24 @@ directly. Concretely, we will
 
 This is a small illustrative experiment, not a reproduction of the paper's benchmark comparisons.
 CPU simulation does not establish a computational advantage over classical attention.
+
+Prerequisites and scope
+-----------------------
+
+You should be comfortable with qubit gates, expectation values, binary classification, and basic
+PyTorch optimization. For a gentler introduction to the learning loop, start with
+:doc:`demos/tutorial_variational_classifier`.
+
+This tutorial operates on one classical feature vector at a time. It is not a complete vision
+transformer: it does not construct image patches, a token-to-token attention matrix, or a softmax
+attention layer. Both the feature-extraction circuit and the classifier are trained jointly;
+"feature extractor" does not mean that its parameters are frozen.
+
+Running the Python script requires PennyLane, PennyLane-Lightning, PyTorch, Matplotlib, and the
+PennyLane dataset dependencies (``h5py``, ``fsspec``, and ``aiohttp``). The first data load requires
+network access. The repository's demo builder installs core dependencies and the additional
+dependency in ``requirements.in``. Training a state-vector simulation can be expensive; see
+the reduced-budget recipe below before running the full experiment.
 """
 
 import matplotlib.pyplot as plt
@@ -38,11 +60,36 @@ torch.manual_seed(7)
 # :math:`N_r = \lceil \log_2 D \rceil` qubits with **amplitude encoding**
 #
 # .. math::
-#     \lvert \psi(x) \rangle = \sum_{i} x_i \lvert i \rangle.
+#     \lvert \psi(x) \rangle = \frac{1}{\lVert x \rVert_2}\sum_i x_i \lvert i \rangle,
+#     \qquad \lVert x \rVert_2 > 0.
 #
 # The network uses four registers (query, key, value and the quantum-logic-similarity result), which
 # in our case (with :math:`D = 16`) needs only :math:`4 \times 4 = 16` qubits. We begin by loading the
 # same :math:`16`-dimensional features into the query, key and value registers.
+# These are three preparations from known classical data, not copies of an unknown quantum state.
+# Normalization removes the overall scale of each input; information encoded only in that scale
+# is not retained. :class:`~pennylane.AmplitudeEmbedding` performs this normalization for us.
+#
+# After the swaps and value preparation, the physical wires have the following roles:
+#
+# .. list-table:: Register layout before the classifier
+#    :header-rows: 1
+#
+#    * - Wires
+#      - State or role
+#      - Used by classifier?
+#    * - 0--3
+#      - Value
+#      - Yes
+#    * - 4--7
+#      - Query
+#      - Yes
+#    * - 8--11
+#      - Key
+#      - No, but participates in QLS
+#    * - 12--15
+#      - QLS result
+#      - No direct readout
 #
 
 ###############################################################################
@@ -67,6 +114,8 @@ def state_preparation(f=None):
 # :math:`\lvert K \rangle = U_k(\theta_k)\lvert\psi\rangle` and
 # :math:`\lvert V \rangle = U_v(\theta_v)\lvert\psi\rangle`. Each layer alternates single-qubit
 # :math:`RY` rotations with nearest-neighbour :math:`CNOT` entangling gates.
+# A fixed Hadamard on every wire precedes the trainable layers. Each unitary is applied on wires
+# 0--3; the swaps move its output to the appropriate register before the next unitary is applied.
 #
 
 
@@ -92,10 +141,14 @@ def combine_unitary_embedding(number_layers, theta_list):
 #
 # The **barbell operation** swaps the content of two registers, here to move the query state
 # :math:`\lvert Q \rangle` into the second register before both are consumed by the similarity
-# module. The **quantum logic similarity (QLS) module** [#QSAN]_ is the quantum analogue of the
-# dot-product attention score :math:`Q K^T`: TOFFOLI gates compare each pair of query/key qubits and
+# module. The **quantum logic similarity (QLS) module** [#QSAN]_ is a Boolean comparison inspired by
+# attention, not an implementation of the ordinary real-valued dot product :math:`Q K^T`.
+# Toffoli gates write the pairwise AND of query/key computational-basis bits into the result, and
 # two :math:`CNOT` gates propagate partial parity along wires 12, 13 and 14. We preserve the
 # reference implementation's shortened cascade; wire 15 retains its pairwise comparison.
+# For example, query bits ``1101`` and key bits ``1011`` first produce ``1001`` in an initially
+# zero result register. CNOTs 12->13 and 13->14 then produce ``1111``. On superposed inputs these
+# operations act coherently and can entangle the registers; the result is not a classical score.
 #
 
 
@@ -170,9 +223,14 @@ X_test, Y_test = X_test[:N_TEST], Y_test[:N_TEST]
 assert X.shape == (N_TRAIN, 16) and Y.shape == (N_TRAIN,)
 assert X_test.shape == (N_TEST, 16) and Y_test.shape == (N_TEST,)
 assert torch.all((Y == -1) | (Y == 1)) and torch.all((Y_test == -1) | (Y_test == 1))
+assert torch.isfinite(X).all() and torch.isfinite(X_test).all()
+assert torch.all(torch.linalg.vector_norm(X, dim=1) > 0)
+assert torch.all(torch.linalg.vector_norm(X_test, dim=1) > 0)
 
 print(f"Train set: {X.shape}, labels {Y.shape}")
 print(f"Test set:  {X_test.shape}, labels {Y_test.shape}")
+print("Training label counts:", {label: int((Y == label).sum()) for label in (-1, 1)})
+print("Test label counts:    ", {label: int((Y_test == label).sum()) for label in (-1, 1)})
 
 ###############################################################################
 # The full quantum circuit
@@ -183,7 +241,7 @@ print(f"Test set:  {X_test.shape}, labels {Y_test.shape}")
 # 1. amplitude-encode the input into the query/key/value registers;
 # 2. prepare the query :math:`\lvert Q \rangle`, swap it into the second register;
 # 3. prepare the key :math:`\lvert K \rangle`, swap it into the third register;
-# 4. compute the quantum logic similarity :math:`\lvert Q \cdot K^T \rangle`;
+# 4. apply the QLS comparison between the query and key registers;
 # 5. prepare the value :math:`\lvert V \rangle`;
 # 6. apply the strongly entangling circuit classifier on the first 8 wires and measure
 #    :math:`\langle Z_0 \rangle`.
@@ -194,13 +252,14 @@ dev = qml.device("lightning.qubit", wires=NUM_QUBITS)
 
 
 @qml.qnode(dev, interface="torch", diff_method="adjoint")
-def full_circuit(x, weights, parameters, num_layers=1):
+def full_circuit(x, weights, parameters):
     """Run the full quantum self-attention classifier.
 
     ``weights[u][l]`` holds the four angles for unitary ``u in {Q, K, V}`` and layer
     ``l``; ``parameters`` are the weights of the strongly entangling circuit classifier.
     """
     state_preparation(f=x)
+    num_layers = weights.shape[1]
 
     # Prepare the query state and swap it into the second register
     combine_unitary_embedding(number_layers=num_layers, theta_list=weights[0])
@@ -240,6 +299,34 @@ weights = torch.nn.Parameter(0.01 * torch.randn(3, N_LAYERS_QK, 4, dtype=torch.f
 print(f"Strongly-entangling-layer parameter shape: {parameters.shape}")
 
 ###############################################################################
+# Inspect one prediction
+# -----------------------
+#
+# The Q/K/V angles have shape ``(3, N_LAYERS_QK, 4)``. The classifier has shape
+# ``(N_LAYERS_STRONG, 8, 3)`` because each wire receives three rotation angles per layer.
+# This configuration contains :math:`12 + 15\times 8\times 3 = 372` trainable parameters.
+#
+# Our analytic (shot-free) simulator returns an expectation value in :math:`[-1, 1]`, not a
+# class label. We predict +1 for a nonnegative value and -1 otherwise, assigning exact zero to
+# +1 consistently. The ``torch`` interface connects the result to PyTorch's gradient graph;
+# adjoint differentiation computes circuit-parameter derivatives on the simulator. This is
+# not a finite-shot hardware training procedure.
+#
+
+
+def predict_labels(expectations):
+    """Convert expectation values to binary labels, assigning zero to +1."""
+    return torch.where(expectations >= 0, 1.0, -1.0)
+
+
+with torch.no_grad():
+    initial_prediction = full_circuit(X[0], weights, parameters)
+print(f"Initial expectation: {initial_prediction.item():.4f}")
+print(
+    f"Predicted label: {predict_labels(initial_prediction).item():+.0f}; target: {Y[0].item():+.0f}"
+)
+
+###############################################################################
 # Cost function and accuracy
 # ---------------------------
 #
@@ -247,10 +334,16 @@ print(f"Strongly-entangling-layer parameter shape: {parameters.shape}")
 # :math:`\langle Z_0 \rangle` and the target label :math:`y \in \{\pm 1\}` and we report the
 # classification accuracy, i.e. how often the sign of the prediction matches the label.
 #
+# For a batch of :math:`B` samples, the mean squared error is
+# :math:`L = B^{-1}\sum_b (y_b-f_\theta(x_b))^2`. Targets are a one-dimensional tensor of shape
+# ``(B,)`` so that subtracting the predictions does not accidentally broadcast into a matrix.
+# MSE encourages expectation values near the target signs; accuracy alone does not measure this
+# margin. A lower MSE need not improve the number of correctly classified examples every epoch.
+#
 
 
 def accuracy(labels, predictions):
-    """Fraction of exact matches between labels and (sign-rounded) predictions."""
+    """Fraction of exact matches between targets and predicted class labels."""
     return (labels == predictions).to(torch.float64).mean().item()
 
 
@@ -268,6 +361,8 @@ def cost(weights, parameters, X, Y):
 # and random initialization differ from the original PennyLane optimizer, so trajectories need not
 # match the paper. Cost and accuracy are recorded on the same, updated parameters each epoch.
 # The test set is used only for reporting, not for selecting hyperparameters or stopping training.
+# Each update clears accumulated gradients, differentiates the batch loss, and updates both sets
+# of angles. Evaluation uses ``torch.no_grad()`` because no derivatives are needed for reporting.
 #
 
 LEARNING_RATE = 0.5
@@ -289,9 +384,9 @@ for it in range(EPOCHS):
     with torch.no_grad():
         predictions = torch.stack([full_circuit(x, weights, parameters) for x in X])
         curr_cost = torch.mean((Y - predictions) ** 2).item()
-        train_acc = accuracy(Y, predictions.sign())
+        train_acc = accuracy(Y, predict_labels(predictions))
         predictions_test = torch.stack([full_circuit(x, weights, parameters) for x in X_test])
-        test_acc = accuracy(Y_test, predictions_test.sign())
+        test_acc = accuracy(Y_test, predict_labels(predictions_test))
 
     cost_history.append(curr_cost)
     train_acc_history.append(train_acc)
@@ -311,6 +406,9 @@ for it in range(EPOCHS):
 # The learning curves below show the cost, the training accuracy and the test accuracy over the 150
 # epochs. Compare training and test accuracy to assess generalisation. High training accuracy alone
 # does not establish an improvement over a fixed readout or a classical baseline.
+# A widening gap suggests overfitting; persistently low accuracy on both sets can indicate
+# optimization difficulties or limited expressivity. Because the test set contains only 30
+# examples, changing one prediction changes its accuracy by about 3.3 percentage points.
 #
 
 fig, axs = plt.subplots(3, 1, figsize=(10, 9))
@@ -335,6 +433,109 @@ final_test_acc = test_acc_history[-1]
 print(f"Final train accuracy: {final_train_acc:0.3f}")
 print(f"Final test accuracy:  {final_test_acc:0.3f}")
 
+###############################################################################
+# How to adapt the experiment
+# ---------------------------
+#
+# The following recipes describe changes to the sections above, rather than launching additional
+# training runs. Restart from initialization after each independent experiment so that trained
+# parameters and optimizer momentum are not silently carried over.
+#
+# Run a small smoke test
+# ~~~~~~~~~~~~~~~~~~~~~~
+#
+# Before a full run, change ``N_TRAIN, N_TEST = 50, 30`` to ``N_TRAIN, N_TEST = 2, 2`` and
+# ``EPOCHS = 150`` to ``EPOCHS = 2``. Keep the register sizes and classifier depth unchanged to
+# exercise the actual architecture. This checks execution, not classification performance.
+# Restore the original budgets for the reported experiment. The full loop makes 130 sample-level
+# forward evaluations per epoch, in addition to the work required for derivatives.
+#
+# To check gradients, insert the following immediately after ``loss.backward()``:
+#
+# .. code-block:: python
+#
+#    for parameter in (weights, parameters):
+#        assert parameter.grad is not None
+#        assert torch.isfinite(parameter.grad).all()
+#        print(parameter.grad.norm().item())
+#
+# A finite gradient is a numerical sanity check, not evidence that optimization will succeed.
+#
+# Use your own binary dataset
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# Replace the dataset-loading block with tensors from your own train/test split. Inputs must have
+# shape ``(number_of_samples, 16)``, finite real values, and nonzero row norms. Targets must be
+# flat arrays containing -1 and +1. If your targets are 0 and 1, map them explicitly:
+#
+# .. code-block:: python
+#
+#    X = torch.as_tensor(train_features, dtype=torch.float64)
+#    X_test = torch.as_tensor(test_features, dtype=torch.float64)
+#    Y = 2 * torch.as_tensor(train_labels_01, dtype=torch.float64).reshape(-1) - 1
+#    Y_test = 2 * torch.as_tensor(test_labels_01, dtype=torch.float64).reshape(-1) - 1
+#
+# Here ``train_features``, ``test_features``, ``train_labels_01``, and ``test_labels_01`` are your
+# arrays, not attributes supplied by PennyLane. Keep the input checks and choose subset sizes no
+# larger than the available splits. Split the data before fitting preprocessing such as PCA or
+# standardization: fit on training data only, then apply the fitted transformation to other splits.
+# Do not normalize a zero vector; decide whether to remove it or use a justified representation.
+#
+# For fewer than 16 features, explicitly zero-pad each row to 16 if that encoding suits the task.
+# For more than 16, fit a reduction to 16 features on the training split, or redesign all register
+# sizes, swaps, QLS wiring, and classifier wires. Changing only ``NUM_QUBITS`` is insufficient.
+#
+# Change circuit depth
+# ~~~~~~~~~~~~~~~~~~~~
+#
+# Set ``N_LAYERS_STRONG`` before constructing ``strong_shape`` and ``parameters``. Set
+# ``N_LAYERS_QK`` before constructing ``weights``; the circuit infers this depth from
+# ``weights.shape[1]``. For example, two Q/K/V layers and five classifier layers require
+# :math:`3\times 2\times 4 + 5\times 8\times 3 = 144` angles. Recreate the optimizer after
+# replacing parameter tensors, otherwise it will retain references to the old tensors.
+#
+# More layers add capacity and simulation cost, but do not guarantee better generalisation.
+# Select depths and learning rates on a separate validation split, never on the final test set.
+#
+# Train only the classifier
+# ~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# To study a fixed feature extractor, set the following before constructing the optimizer:
+#
+# .. code-block:: python
+#
+#    weights.requires_grad_(False)
+#    opt = torch.optim.SGD([parameters], lr=LEARNING_RATE, momentum=0.9, nesterov=True)
+#
+# Start from the same seeded initialization when comparing joint and classifier-only training.
+# This is an ablation of trainability, not a classical-attention baseline.
+#
+# Use a probability-based loss
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# The probability of the +1 eigenvalue of :math:`Z` is :math:`p_+=(1+f_\theta(x))/2`.
+# To associate that measurement outcome with the positive class, replace the MSE return in
+# ``cost`` with binary cross-entropy:
+#
+# .. code-block:: python
+#
+#    probabilities = ((predictions + 1) / 2).clamp(1e-7, 1 - 1e-7)
+#    targets = (Y + 1) / 2
+#    return torch.nn.functional.binary_cross_entropy(probabilities, targets)
+#
+# Clamping prevents logarithms of zero, but changes the objective near the endpoints. Update the
+# reported cost calculation to the same loss as well; otherwise the cost plot still displays MSE.
+# Passing the raw expectation directly as a probability, or using +/-1 targets for binary
+# cross-entropy, is incorrect. The zero-threshold classification rule remains unchanged.
+#
+# Compare results responsibly
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# Use the same data splits and preprocessing for each method, tune only on validation data,
+# and repeat training with multiple seeds. Compare against a fixed circuit readout and a simple
+# classical classifier before claiming an improvement. Report held-out performance, variability,
+# parameter counts, and measured runtime; this tutorial alone does not establish quantum advantage.
+#
 ###############################################################################
 # Conclusion
 # ~~~~~~~~~~
